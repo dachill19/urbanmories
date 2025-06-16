@@ -7,6 +7,7 @@ from scipy.spatial import KDTree
 from functools import lru_cache
 import time
 from collections import defaultdict
+import json
 
 def haversine(coord1, coord2):
     """Calculate Haversine distance between two coordinates (optimized)"""
@@ -36,22 +37,65 @@ class OptimizedAStarPathfinder:
         self.destination = destination
         self.road_graph = defaultdict(list)
         self.all_points = {}
-        self.max_nodes = 5000  # Reduced for better performance
+        self.max_nodes = 5000
         self.connection_threshold = 0.05  # 50 meters for intersections
+        self.osrm_url = "http://router.project-osrm.org"  # Ganti dengan URL server OSRM Anda jika menggunakan instance sendiri
         
     def get_optimal_radius(self):
         """Calculate optimal radius based on distance"""
         direct_dist = geodesic(self.origin, self.destination).kilometers
-        # Use smaller radius for better performance
         return min(max(direct_dist * 1.2, 3), 15)
         
     @lru_cache(maxsize=16)
     def get_road_network(self, center_lat, center_lon, radius_km):
-        """Optimized road network fetching with better query"""
+        """Fetch road network using OSRM as primary source, with Overpass as fallback"""
+        try:
+            coords = f"{self.origin[1]},{self.origin[0]};{self.destination[1]},{self.destination[0]}"
+            osrm_route_url = f"{self.osrm_url}/route/v1/driving/{coords}?steps=true&geometries=geojson&overview=full"
+            response = requests.get(osrm_route_url, timeout=15)
+            
+            if response.status_code != 200:
+                st.warning(f"OSRM API returned status {response.status_code}, falling back to Overpass")
+                return self._get_overpass_road_network(center_lat, center_lon, radius_km)
+                
+            data = response.json()
+            road_segments = []
+            
+            road_weights = {
+                'motorway': 0.6, 'trunk': 0.7, 'primary': 0.8,
+                'secondary': 0.9, 'tertiary': 1.0, 'residential': 1.2
+            }
+            
+            for route in data.get('routes', []):
+                for leg in route.get('legs', []):
+                    for step in leg.get('steps', []):
+                        coords = step['maneuver']['location']
+                        geometry = step.get('geometry', {}).get('coordinates', [])
+                        if len(geometry) >= 2:
+                            coords = [(coord[1], coord[0]) for coord in geometry]
+                            highway_type = step.get('mode', 'driving')
+                            weight = road_weights.get(highway_type, 1.3)
+                            total_length = sum(haversine(coords[i], coords[i+1]) 
+                                             for i in range(len(coords)-1))
+                            if total_length > 0.02:
+                                road_segments.append({
+                                    'coords': coords,
+                                    'weight': weight,
+                                    'id': step.get('name', 'osrm_segment'),
+                                    'length': total_length
+                                })
+            
+            st.info(f"Fetched {len(road_segments)} road segments from OSRM (radius: {radius_km:.1f}km)")
+            return road_segments
+            
+        except Exception as e:
+            st.error(f"Error fetching road network from OSRM: {str(e)}, falling back to Overpass")
+            return self._get_overpass_road_network(center_lat, center_lon, radius_km)
+
+    def _get_overpass_road_network(self, center_lat, center_lon, radius_km):
+        """Fallback to Overpass API for road network"""
         try:
             overpass_url = "http://overpass-api.de/api/interpreter"
-            
-            # More focused query with timeout optimization
             query = f"""
             [out:json][timeout:30];
             (
@@ -60,17 +104,14 @@ class OptimizedAStarPathfinder:
             );
             out geom;
             """
-            
             response = requests.get(overpass_url, params={'data': query}, timeout=25)
             
             if response.status_code != 200:
-                st.warning(f"OSM API returned status {response.status_code}")
+                st.warning(f"Overpass API returned status {response.status_code}")
                 return []
                 
             data = response.json()
             road_segments = []
-            
-            # Optimized road weights
             road_weights = {
                 'motorway': 0.6, 'trunk': 0.7, 'primary': 0.8,
                 'secondary': 0.9, 'tertiary': 1.0, 'residential': 1.2
@@ -82,11 +123,9 @@ class OptimizedAStarPathfinder:
                     if len(coords) >= 2:
                         highway_type = element.get('tags', {}).get('highway', 'residential')
                         weight = road_weights.get(highway_type, 1.3)
-                        
-                        # Filter out very short segments
                         total_length = sum(haversine(coords[i], coords[i+1]) 
                                          for i in range(len(coords)-1))
-                        if total_length > 0.02:  # At least 20 meters
+                        if total_length > 0.02:
                             road_segments.append({
                                 'coords': coords,
                                 'weight': weight,
@@ -94,14 +133,12 @@ class OptimizedAStarPathfinder:
                                 'length': total_length
                             })
             
-            # Sort by road importance and length
             road_segments.sort(key=lambda x: (x['weight'], -x['length']))
-            
-            st.info(f"Fetched {len(road_segments)} road segments (radius: {radius_km:.1f}km)")
+            st.info(f"Fetched {len(road_segments)} road segments from Overpass (radius: {radius_km:.1f}km)")
             return road_segments
             
         except Exception as e:
-            st.error(f"Error fetching road network: {str(e)}")
+            st.error(f"Error fetching road network from Overpass: {str(e)}")
             return []
 
     def build_optimized_graph(self, road_segments):
@@ -112,17 +149,12 @@ class OptimizedAStarPathfinder:
         coord_to_point = {}
         road_endpoints = set()
         
-        # Process road segments more efficiently
         for road_idx, road in enumerate(road_segments):
             coords = road['coords']
             weight = road['weight']
-            
-            # Process each road segment
             prev_point = None
             for i, coord in enumerate(coords):
-                # Round coordinates for consistent mapping
                 rounded_coord = (round(coord[0], 6), round(coord[1], 6))
-                
                 if rounded_coord not in coord_to_point:
                     point_key = rounded_coord
                     coord_to_point[rounded_coord] = point_key
@@ -132,15 +164,12 @@ class OptimizedAStarPathfinder:
                 else:
                     point_key = coord_to_point[rounded_coord]
                 
-                # Mark endpoints for intersection detection
                 if i == 0 or i == len(coords) - 1:
                     road_endpoints.add(point_key)
                 
-                # Connect to previous point in the same road
                 if prev_point is not None:
                     distance = haversine(self.all_points[prev_point], coord)
-                    if distance > 0.001:  # Minimum distance threshold
-                        # Add bidirectional connection
+                    if distance > 0.001:
                         self.road_graph[prev_point].append({
                             'point': point_key,
                             'distance': distance,
@@ -155,20 +184,15 @@ class OptimizedAStarPathfinder:
                         })
                 
                 prev_point = point_key
-                
-                # Limit total nodes
                 if len(coords_list) >= self.max_nodes:
                     break
             
             if len(coords_list) >= self.max_nodes:
                 break
         
-        # Add intersection connections using KDTree
         if len(coords_list) > 1:
             tree = KDTree(coords_list)
-            
-            # Find potential intersections
-            threshold_deg = self.connection_threshold / 111.0  # Convert km to degrees
+            threshold_deg = self.connection_threshold / 111.0
             pairs = tree.query_pairs(threshold_deg, output_type='ndarray')
             
             intersection_count = 0
@@ -176,21 +200,15 @@ class OptimizedAStarPathfinder:
                 if i < len(point_keys) and j < len(point_keys):
                     point1 = point_keys[i]
                     point2 = point_keys[j]
-                    
-                    # Only connect if at least one is a road endpoint or intersection
                     if point1 in road_endpoints or point2 in road_endpoints:
-                        # Check if not already connected
                         already_connected = any(
                             neighbor['point'] == point2 
                             for neighbor in self.road_graph[point1]
                         )
-                        
                         if not already_connected:
                             distance = haversine(coords_list[i], coords_list[j])
                             if distance < self.connection_threshold:
-                                # Use higher weight for intersection connections
                                 intersection_weight = 1.5
-                                
                                 self.road_graph[point1].append({
                                     'point': point2,
                                     'distance': distance,
@@ -207,16 +225,14 @@ class OptimizedAStarPathfinder:
             
             st.info(f"Added {intersection_count} intersection connections")
         
-        # Optimize connections per node
         for point in self.road_graph:
             connections = self.road_graph[point]
-            # Sort by distance and keep best connections
             connections.sort(key=lambda x: x['distance'] * x['weight'])
-            self.road_graph[point] = connections[:10]  # Limit connections per node
+            self.road_graph[point] = connections[:10]
         
         build_time = time.time() - start_time
         st.info(f"Graph built in {build_time:.2f}s with {len(self.all_points)} nodes")
-        return build_time < 20  # Timeout check
+        return build_time < 20
 
     def find_nearest_points(self, target_point, k=3):
         """Find k nearest graph points with distance check"""
@@ -229,7 +245,6 @@ class OptimizedAStarPathfinder:
         tree = KDTree(coords)
         distances, indices = tree.query(target_array, k=min(k, len(coords)))
         
-        # Handle both single and multiple results
         if np.isscalar(indices):
             indices = [indices]
             distances = [distances]
@@ -241,31 +256,26 @@ class OptimizedAStarPathfinder:
         results = []
         
         for idx, dist in zip(indices, distances):
-            if dist < 0.1:  # Within 100m
+            if dist < 0.1:
                 results.append((point_keys[idx], dist))
         
         return results
 
     def enhanced_a_star(self):
-        """Enhanced A* with multiple start/end points and better heuristics"""
+        """Enhanced A* using OSRM only for road network data"""
         start_time = time.time()
-        
-        # Calculate optimal search area
         radius = self.get_optimal_radius()
         center_lat = (self.origin[0] + self.destination[0]) / 2
         center_lon = (self.origin[1] + self.destination[1]) / 2
         
-        # Fetch road network
         road_segments = self.get_road_network(center_lat, center_lon, radius)
         
         if not road_segments:
             return self._fallback_result("No road data available")
         
-        # Build optimized graph
         if not self.build_optimized_graph(road_segments):
             return self._fallback_result("Graph construction failed or timed out")
         
-        # Find multiple start and end candidates
         start_candidates = self.find_nearest_points(self.origin, k=3)
         end_candidates = self.find_nearest_points(self.destination, k=3)
         
@@ -277,10 +287,9 @@ class OptimizedAStarPathfinder:
         best_result = None
         best_distance = float('inf')
         
-        # Try multiple start-end combinations
-        for start_point, start_dist in start_candidates[:2]:  # Limit to 2 for performance
+        for start_point, start_dist in start_candidates[:2]:
             for end_point, end_dist in end_candidates[:2]:
-                if time.time() - start_time > 25:  # Time limit
+                if time.time() - start_time > 25:
                     break
                 
                 result = self._run_a_star(start_point, end_point, start_dist, end_dist)
@@ -290,27 +299,24 @@ class OptimizedAStarPathfinder:
                     best_result = result
         
         if best_result:
-            best_result['method'] = 'Enhanced A*'
-            best_result['note'] = f'Optimized route using {len(road_segments)} road segments'
+            best_result['method'] = 'Pure A* with OSRM Network'
+            best_result['note'] = f'Optimized route using {len(road_segments)} OSRM road segments, computed with A*'
             return best_result
         else:
-            return self._fallback_result("No valid path found")
+            return self._fallback_result("No valid path found with A*")
 
     def _run_a_star(self, start_point, end_point, start_dist, end_dist):
         """Run A* algorithm between two specific points"""
-        # A* algorithm with optimizations
-        open_set = [(0, start_point, 0, [])]  # (f_score, point, g_score, path)
+        open_set = [(0, start_point, 0, [])]
         g_score = {start_point: 0}
         closed_set = set()
         iteration = 0
         max_iterations = min(self.max_nodes, 3000)
         
-        # Precompute heuristic to destination
         dest_coord = self.all_points[end_point]
         
         while open_set and iteration < max_iterations:
             iteration += 1
-            
             current_f, current, current_g, current_path = heapq.heappop(open_set)
             
             if current in closed_set:
@@ -319,9 +325,7 @@ class OptimizedAStarPathfinder:
             closed_set.add(current)
             new_path = current_path + [current]
             
-            # Check if we reached the destination
             if current == end_point:
-                # Construct final path
                 final_path = []
                 if start_dist > 0.01:
                     final_path.append(self.origin)
@@ -332,7 +336,6 @@ class OptimizedAStarPathfinder:
                 if end_dist > 0.01:
                     final_path.append(self.destination)
                 
-                # Calculate total distance
                 total_distance = 0
                 for i in range(len(final_path) - 1):
                     total_distance += haversine(final_path[i], final_path[i + 1])
@@ -346,7 +349,6 @@ class OptimizedAStarPathfinder:
                     'end_dist': end_dist
                 }
             
-            # Explore neighbors
             current_coord = self.all_points[current]
             
             for neighbor_info in self.road_graph.get(current, []):
@@ -360,74 +362,64 @@ class OptimizedAStarPathfinder:
                 
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     g_score[neighbor] = tentative_g_score
-                    
-                    # Improved heuristic
                     neighbor_coord = self.all_points[neighbor]
                     h_score = haversine(neighbor_coord, dest_coord)
-                    
-                    # Add slight penalty for direction changes
                     direction_penalty = 0
                     if len(new_path) >= 2:
                         prev_coord = self.all_points[new_path[-2]]
-                        # Calculate angle difference (simplified)
                         direction_penalty = 0.01
                     
                     f_score = tentative_g_score + h_score + direction_penalty
-                    
                     heapq.heappush(open_set, (f_score, neighbor, tentative_g_score, new_path))
         
-        return None  # No path found
+        return None
 
     def _fallback_result(self, reason):
-        """Return direct route as fallback"""
+        """Return direct route as fallback without OSRM"""
         return {
             'path': [self.origin, self.destination],
             'distance': geodesic(self.origin, self.destination).kilometers,
             'visited_nodes': [self.origin, self.destination],
             'iterations': 1,
             'method': 'Direct',
-            'note': reason + ' - using direct route'
+            'note': reason + ' - using direct route (no OSRM fallback)'
         }
 
-# Alternative simpler A* implementation for comparison
 class SimpleAStarPathfinder:
     def __init__(self, origin, destination):
         self.origin = origin
         self.destination = destination
+        self.osrm_url = "http://router.project-osrm.org"
         
     def get_simple_road_network(self, radius_km=8):
-        """Simplified road network query"""
+        """Simplified road network query using OSRM"""
         try:
             center_lat = (self.origin[0] + self.destination[0]) / 2
             center_lon = (self.origin[1] + self.destination[1]) / 2
+            coords = f"{self.origin[1]},{self.origin[0]};{self.destination[1]},{self.destination[0]}"
+            osrm_url = f"{self.osrm_url}/route/v1/driving/{coords}?steps=true&geometries=geojson&overview=full"
+            response = requests.get(osrm_url, timeout=15)
             
-            overpass_url = "http://overpass-api.de/api/interpreter"
-            query = f"""
-            [out:json][timeout:20];
-            (
-              way["highway"~"^(primary|secondary|tertiary)$"]
-                  (around:{radius_km*1000},{center_lat},{center_lon});
-            );
-            out geom;
-            """
-            
-            response = requests.get(overpass_url, params={'data': query}, timeout=15)
+            if response.status_code != 200:
+                st.warning(f"OSRM API returned status {response.status_code}")
+                return []
+                
             data = response.json()
-            
             road_points = []
-            for element in data.get('elements', []):
-                if element.get('type') == 'way' and 'geometry' in element:
-                    coords = [(node['lat'], node['lon']) for node in element['geometry']]
-                    road_points.extend(coords)
+            for route in data.get('routes', []):
+                for leg in route.get('legs', []):
+                    for step in leg.get('steps', []):
+                        geometry = step.get('geometry', {}).get('coordinates', [])
+                        road_points.extend([(coord[1], coord[0]) for coord in geometry])
             
-            return list(set(road_points))  # Remove duplicates
+            return list(set(road_points))
             
         except Exception as e:
             st.error(f"Simple network fetch error: {str(e)}")
             return []
     
     def simple_a_star(self):
-        """Simplified A* using grid-based approach"""
+        """Simplified A* using OSRM-based road points"""
         road_points = self.get_simple_road_network()
         
         if len(road_points) < 10:
@@ -439,18 +431,15 @@ class SimpleAStarPathfinder:
                 'note': 'Insufficient road data - using direct route'
             }
         
-        # Find nearest road points
         road_coords = np.array(road_points)
         origin_tree = KDTree(road_coords)
         
-        # Find nearest points to origin and destination
         _, start_idx = origin_tree.query([self.origin])
         _, end_idx = origin_tree.query([self.destination])
         
         start_point = road_points[start_idx[0]]
         end_point = road_points[end_idx[0]]
         
-        # Simple pathfinding through road network
         visited = set()
         queue = [(0, start_point, [start_point])]
         
@@ -462,7 +451,7 @@ class SimpleAStarPathfinder:
                 
             visited.add(current_point)
             
-            if haversine(current_point, end_point) < 0.1:  # Close to destination
+            if haversine(current_point, end_point) < 0.1:
                 final_path = [self.origin] + path + [self.destination]
                 total_distance = sum(haversine(final_path[i], final_path[i+1]) 
                                    for i in range(len(final_path)-1))
@@ -470,21 +459,19 @@ class SimpleAStarPathfinder:
                 return {
                     'path': final_path,
                     'distance': total_distance,
-                    'visited_nodes': path[::max(1, len(path)//20)],
-                    'method': 'Simple A*',
-                    'note': f'Simple route through {len(road_points)} road points'
+                    'visited_nodes': final_path[::max(1, len(final_path)//20)],
+                    'method': 'Simple A* with OSRM Network',
+                    'note': f'Simple route through {len(road_points)} OSRM road points, computed with A*'
                 }
             
-            # Add nearby road points to queue
             for point in road_points:
                 if point not in visited:
                     dist_to_point = haversine(current_point, point)
-                    if dist_to_point < 0.5:  # Within 500m
+                    if dist_to_point < 0.5:
                         heuristic = haversine(point, end_point)
                         total_cost = current_dist + dist_to_point + heuristic
                         heapq.heappush(queue, (total_cost, point, path + [point]))
         
-        # Fallback to direct route
         return {
             'path': [self.origin, self.destination],
             'distance': geodesic(self.origin, self.destination).kilometers,
@@ -495,7 +482,7 @@ class SimpleAStarPathfinder:
 
 def calculate_optimized_astar_path(origin, destination, method='enhanced'):
     """
-    Calculate path using optimized A* algorithm
+    Calculate path using optimized A* algorithm with OSRM for network data only
     
     Args:
         origin: (lat, lon) tuple for start point
@@ -511,3 +498,4 @@ def calculate_optimized_astar_path(origin, destination, method='enhanced'):
     else:
         pathfinder = OptimizedAStarPathfinder(origin, destination)
         return pathfinder.enhanced_a_star()
+    
