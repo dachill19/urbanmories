@@ -276,7 +276,7 @@ def show_search_page():
                     
                     with col_rank:
                         # Ranking with emoji
-                        rank_emoji = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}️⃣"
+                        rank_emoji = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"#{idx}"
                         st.markdown(f"## {rank_emoji}")
                     
                     with col_info:

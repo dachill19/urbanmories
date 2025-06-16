@@ -141,7 +141,7 @@ def search_nearby_hotels(lat, lon, radius_km=5, _cache_key=None):
                 })
             
             hotels = sorted(hotels, key=lambda x: x['distance_km'])
-            return hotels[:15]
+            return hotels[:50]
             
     except Exception as e:
         st.error(f"Error mencari hotel: {str(e)}")
